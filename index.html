@@ -15,10 +15,47 @@
   html,body{margin:0;padding:0;background:#F5F1E8;}
   #root{min-height:100vh;}
   .boot-loading{display:flex;align-items:center;justify-content:center;height:100vh;font-family:sans-serif;color:#647167;direction:rtl;}
+  .boot-error{direction:rtl;padding:28px;font-family:sans-serif;color:#B14B58;white-space:pre-wrap;line-height:1.7;max-width:600px;margin:0 auto;}
+  .boot-error h2{color:#23312B;font-size:18px;}
+  .boot-error code{background:#F3DEE0;padding:2px 6px;border-radius:5px;font-size:13px;}
 </style>
-<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
-<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script>
+  window.__bootFailed = false;
+  function showBootError(msg) {
+    window.__bootFailed = true;
+    var el = document.getElementById('root');
+    if (el) {
+      el.innerHTML = '<div class="boot-error"><h2>האפליקציה לא עלתה כראוי</h2>' + msg + '<br><br>אפשר לצלם מסך את ההודעה הזו ולשלוח אותה לצ׳אט לבדיקה.</div>';
+    }
+  }
+  window.addEventListener('error', function (e) {
+    if (window.__appMounted) return;
+    var text = (e.message || (e.error && e.error.message) || 'שגיאה לא ידועה') +
+      (e.filename ? '\n\nקובץ: ' + e.filename + ' (שורה ' + e.lineno + ')' : '');
+    showBootError('<code>' + text.replace(/</g, '&lt;') + '</code>');
+  });
+  window.addEventListener('unhandledrejection', function (e) {
+    if (window.__appMounted) return;
+    var reason = e.reason && e.reason.message ? e.reason.message : String(e.reason);
+    showBootError('<code>' + reason.replace(/</g, '&lt;') + '</code>');
+  });
+  window.addEventListener('DOMContentLoaded', function () {
+    setTimeout(function () {
+      if (!window.__appMounted && !window.__bootFailed) {
+        showBootError(
+          'נראה שאחת מהספריות החיצוניות לא נטענה (React / Babel / Google) — ייתכן שזה בגלל חסימת רשת, חוסם פרסומות, או בעיית אינטרנט.\n\n' +
+          'בדיקות אפשריות:\n' +
+          '• ודאו שיש חיבור אינטרנט תקין\n' +
+          '• נסו לפתוח את הכתובת בדפדפן אחר (Chrome במחשב, למשל) ולבדוק אם הכלים למפתחים (F12) מציגים שגיאה אדומה\n' +
+          '• כבו זמנית חוסמי פרסומות/פרטיות אם יש כאלה'
+        );
+      }
+    }, 6000);
+  });
+</script>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js" onerror="showBootError('לא ניתן היה לטעון את React מ-unpkg.com. בדקו חיבור אינטרנט או חוסם פרסומות.')"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" onerror="showBootError('לא ניתן היה לטעון את React-DOM מ-unpkg.com. בדקו חיבור אינטרנט או חוסם פרסומות.')"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js" onerror="showBootError('לא ניתן היה לטעון את Babel מ-unpkg.com. בדקו חיבור אינטרנט או חוסם פרסומות.')"></script>
 <script src="https://accounts.google.com/gsi/client" async defer></script>
 </head>
 <body>
@@ -1240,6 +1277,7 @@ function PaymentModal({ initial, patients, onClose, onSave }) {
 
 const root = ReactDOM.createRoot(document.getElementById("root"));
 root.render(<App />);
+window.__appMounted = true;
 
 </script>
 </body>

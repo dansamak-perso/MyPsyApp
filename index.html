@@ -113,7 +113,7 @@ const MONTH_NAMES = [
   "\u05D3\u05E6\u05DE\u05D1\u05E8",
 ];
 const METHODS = { cash: "\u05DE\u05D6\u05D5\u05DE\u05DF", card: "\u05D0\u05E9\u05E8\u05D0\u05D9", transfer: "\u05D4\u05E2\u05D1\u05E8\u05D4", bit: "\u05D1\u05D9\u05D8" };
-const APP_VERSION = "3.1";
+const APP_VERSION = "3.6";
 const TIME_START = 8;
 const TIME_END = 21;
 const PX_PER_HOUR = 64;
@@ -351,6 +351,130 @@ html, body { margin:0; padding:0; height:100%; background:#F5F1E8; }
 }
 @media (min-width: 721px) { .bottom-nav { display:none !important; } }
 `;
+// ---------- storage layer v3 ----------
+// Audio recordings live in IndexedDB (large quota); localStorage only keeps
+// a short reference ("idb:<key>"). Every record carries updatedAt and deletions
+// leave tombstones, so two devices can be merged record by record.
+const AUDIO_MARK = "idb:";
+let audioDbPromise = null;
+function audioDb() {
+  if (audioDbPromise) return audioDbPromise;
+  audioDbPromise = new Promise((resolve, reject) => {
+    try {
+      if (!window.indexedDB) throw new Error("no-idb");
+      const req = window.indexedDB.open("clinic_audio", 1);
+      req.onupgradeneeded = () => req.result.createObjectStore("notes");
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error || new Error("idb-open"));
+    } catch (e) {
+      reject(e);
+    }
+  });
+  audioDbPromise.catch(() => {
+    audioDbPromise = null;
+  });
+  return audioDbPromise;
+}
+function idbRun(mode, fn) {
+  return audioDb().then(
+    (db) =>
+      new Promise((resolve, reject) => {
+        const tx = db.transaction("notes", mode);
+        const req = fn(tx.objectStore("notes"));
+        tx.oncomplete = () => resolve(req ? req.result : void 0);
+        tx.onerror = () => reject(tx.error);
+        tx.onabort = () => reject(tx.error || new Error("idb-abort"));
+      }),
+  );
+}
+const audioGet = (k) => idbRun("readonly", (s) => s.get(k));
+const audioPut = (k, v) => idbRun("readwrite", (s) => s.put(v, k));
+const audioDel = (k) => idbRun("readwrite", (s) => s.delete(k));
+const audioKeys = () => idbRun("readonly", (s) => s.getAllKeys());
+const isInlineAudio = (v) => typeof v === "string" && v.startsWith("data:");
+const isAudioRef = (v) => typeof v === "string" && v.startsWith(AUDIO_MARK);
+const audioKeyOf = (v) => v.slice(AUDIO_MARK.length);
+
+const SYNC_COLS = ["patients", "appointments", "payments"];
+const TOMBSTONE_DAYS = 180;
+function stampChanges(prev, next) {
+  const now = /* @__PURE__ */ new Date().toISOString();
+  const out = { ...next, savedAt: now };
+  const deleted = { ...(prev.deleted || {}), ...(next.deleted || {}) };
+  SYNC_COLS.forEach((col) => {
+    const before = new Map((prev[col] || []).map((r) => [r.id, r]));
+    const kept = new Set();
+    out[col] = (next[col] || []).map((r) => {
+      kept.add(r.id);
+      return before.get(r.id) === r ? r : { ...r, updatedAt: now };
+    });
+    before.forEach((_, id) => {
+      if (!kept.has(id)) deleted[id] = now;
+    });
+    out[col].forEach((r) => {
+      if (deleted[r.id] && deleted[r.id] <= (r.updatedAt || "")) delete deleted[r.id];
+    });
+  });
+  const cutoff = new Date(Date.now() - TOMBSTONE_DAYS * 864e5).toISOString();
+  Object.keys(deleted).forEach((id) => {
+    if (deleted[id] < cutoff) delete deleted[id];
+  });
+  out.deleted = deleted;
+  return out;
+}
+function mergeData(local, remote) {
+  if (!remote) return local;
+  const localNewer = (local.savedAt || "") > (remote.savedAt || "");
+  const newer = localNewer ? local : remote;
+  const older = localNewer ? remote : local;
+  const deleted = { ...(remote.deleted || {}) };
+  Object.entries(local.deleted || {}).forEach(([id, t]) => {
+    if (!deleted[id] || t > deleted[id]) deleted[id] = t;
+  });
+  const out = { ...older, ...newer };
+  SYNC_COLS.forEach((col) => {
+    const map = new Map();
+    (remote[col] || []).forEach((r) => map.set(r.id, r));
+    (local[col] || []).forEach((r) => {
+      const o = map.get(r.id);
+      if (!o) {
+        map.set(r.id, r);
+        return;
+      }
+      const a = r.updatedAt || "";
+      const b = o.updatedAt || "";
+      if (a > b || (a === b && localNewer)) map.set(r.id, r);
+    });
+    out[col] = Array.from(map.values()).filter((r) => !(deleted[r.id] && deleted[r.id] >= (r.updatedAt || "")));
+  });
+  out.dismissals = { ...(older.dismissals || {}), ...(newer.dismissals || {}) };
+  out.deleted = deleted;
+  out.savedAt = [local.savedAt || "", remote.savedAt || ""].sort().pop() || void 0;
+  return out;
+}
+function dataSig(d) {
+  if (!d) return "null";
+  return JSON.stringify(d, (k, v) => {
+    if (k === "savedAt") return void 0;
+    if (k === "voiceNote" && typeof v === "string") return isAudioRef(v) ? v : "a" + v.length;
+    return v;
+  });
+}
+async function materializeAudio(d, fallback) {
+  const fb = new Map(((fallback && fallback.appointments) || []).map((a) => [a.id, a.voiceNote]));
+  const appointments = await Promise.all(
+    (d.appointments || []).map(async (a) => {
+      if (!isAudioRef(a.voiceNote)) return a;
+      let v = null;
+      try {
+        v = await audioGet(audioKeyOf(a.voiceNote));
+      } catch (e) {}
+      if (!isInlineAudio(v) && isInlineAudio(fb.get(a.id))) v = fb.get(a.id);
+      return isInlineAudio(v) ? { ...a, voiceNote: v } : a;
+    }),
+  );
+  return { ...d, appointments };
+}
 function useClinicData() {
   const [data, setDataState] = useState(() => {
     try {
@@ -372,10 +496,72 @@ function useClinicData() {
   const pushTimerRef = useRef(null);
   const dataRef = useRef(data);
   dataRef.current = data;
-  function saveLocal(next) {
+  const [saveError, setSaveError] = useState(null);
+  const storedAudioRef = useRef(/* @__PURE__ */ new Map());
+  const idbBrokenRef = useRef(false);
+  const gcTimerRef = useRef(null);
+  const syncedVersionRef = useRef(localStorage.getItem("gdrive_synced_version") || null);
+  const syncingRef = useRef(null);
+  const againRef = useRef(false);
+  const dirtyRef = useRef(false);
+  const lastPullRef = useRef(0);
+  function writeLocal(obj) {
     try {
-      localStorage.setItem(LOCAL_KEY, JSON.stringify(next));
-    } catch (e) {}
+      localStorage.setItem(LOCAL_KEY, JSON.stringify(obj));
+      setSaveError(null);
+      return true;
+    } catch (e) {
+      setSaveError("\u26A0\uFE0F \u05D4\u05E9\u05DE\u05D9\u05E8\u05D4 \u05D1\u05DE\u05DB\u05E9\u05D9\u05E8 \u05E0\u05DB\u05E9\u05DC\u05D4 \u2014 \u05D4\u05E9\u05D9\u05E0\u05D5\u05D9\u05D9\u05DD \u05D4\u05D0\u05D7\u05E8\u05D5\u05E0\u05D9\u05DD \u05E2\u05DC\u05D5\u05DC\u05D9\u05DD \u05DC\u05D0 \u05DC\u05D4\u05D9\u05E9\u05DE\u05E8. \u05D0\u05DC \u05EA\u05E1\u05D2\u05E8\u05D5 \u05D0\u05EA \u05D4\u05D0\u05E4\u05DC\u05D9\u05E7\u05E6\u05D9\u05D4 \u05D5\u05D1\u05E6\u05E2\u05D5 \u05D2\u05D9\u05D1\u05D5\u05D9 \u05D1\u05D4\u05D2\u05D3\u05E8\u05D5\u05EA.");
+      return false;
+    }
+  }
+  function scheduleAudioGc() {
+    if (idbBrokenRef.current) return;
+    if (gcTimerRef.current) clearTimeout(gcTimerRef.current);
+    gcTimerRef.current = setTimeout(() => {
+      const keep = /* @__PURE__ */ new Set();
+      (dataRef.current.appointments || []).forEach((a) => {
+        if (isAudioRef(a.voiceNote)) keep.add(audioKeyOf(a.voiceNote));
+        else if (isInlineAudio(a.voiceNote)) keep.add(a.id);
+      });
+      audioKeys()
+        .then((keys) =>
+          keys.forEach((k) => {
+            if (!keep.has(k)) {
+              storedAudioRef.current.delete(k);
+              audioDel(k).catch(() => {});
+            }
+          }),
+        )
+        .catch(() => {});
+    }, 4e3);
+  }
+  function saveLocal(next) {
+    if (idbBrokenRef.current) {
+      writeLocal(next);
+      return;
+    }
+    const pending = [];
+    const shaped = {
+      ...next,
+      appointments: (next.appointments || []).map((a) => {
+        if (!isInlineAudio(a.voiceNote)) return a;
+        if (storedAudioRef.current.get(a.id) === a.voiceNote) return { ...a, voiceNote: AUDIO_MARK + a.id };
+        pending.push([a.id, a.voiceNote]);
+        return a;
+      }),
+    };
+    writeLocal(shaped);
+    if (!pending.length) {
+      scheduleAudioGc();
+      return;
+    }
+    Promise.all(pending.map(([k, v]) => audioPut(k, v).then(() => storedAudioRef.current.set(k, v))))
+      .then(() => saveLocal(dataRef.current))
+      .catch(() => {
+        idbBrokenRef.current = true;
+        writeLocal(dataRef.current);
+      });
   }
   function waitForGsi(cb) {
     if (window.google && window.google.accounts && window.google.accounts.oauth2) {
@@ -456,12 +642,83 @@ function useClinicData() {
     }
   }
   async function uploadToDrive(token, fileId, payload) {
-    const res = await fetch(`https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media`, {
+    const res = await fetch(`https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media&fields=version`, {
       method: "PATCH",
       headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
     if (!res.ok) throw new Error("upload failed");
+    try {
+      const j = await res.json();
+      return j && j.version != null ? String(j.version) : null;
+    } catch (e) {
+      return null;
+    }
+  }
+  async function getRemoteVersion(token, fileId) {
+    const res = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}?fields=version`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) throw new Error("meta failed");
+    const j = await res.json();
+    return j && j.version != null ? String(j.version) : null;
+  }
+  function rememberVersion(v) {
+    syncedVersionRef.current = v;
+    if (v) localStorage.setItem("gdrive_synced_version", v);
+    else localStorage.removeItem("gdrive_synced_version");
+  }
+  function applyMerged(next) {
+    dataRef.current = next;
+    setDataState(next);
+    saveLocal(next);
+  }
+  function syncNow(token) {
+    if (syncingRef.current) {
+      againRef.current = true;
+      return syncingRef.current;
+    }
+    const wasDirty = dirtyRef.current;
+    dirtyRef.current = false;
+    setDriveStatus("syncing");
+    const run = (async () => {
+      const fileId = await findOrCreateFile(token);
+      const remoteVersion = await getRemoteVersion(token, fileId);
+      let remote = null;
+      let merged = dataRef.current;
+      const remoteChanged = remoteVersion !== syncedVersionRef.current;
+      if (remoteChanged) {
+        remote = await downloadFromDrive(token, fileId);
+        merged = mergeData(dataRef.current, remote);
+        if (dataSig(merged) !== dataSig(dataRef.current)) applyMerged(merged);
+      }
+      const needUpload = remoteChanged ? dataSig(merged) !== dataSig(remote) : wasDirty;
+      if (needUpload) {
+        const payload = await materializeAudio(merged, remote);
+        const v = await uploadToDrive(token, fileId, payload);
+        rememberVersion(v || (await getRemoteVersion(token, fileId)));
+      } else if (remoteChanged) {
+        rememberVersion(remoteVersion);
+      }
+      lastPullRef.current = Date.now();
+      markSynced();
+      return true;
+    })()
+      .catch(() => {
+        dirtyRef.current = dirtyRef.current || wasDirty;
+        setDriveStatus("error");
+        setDriveError("\u05D4\u05E1\u05E0\u05DB\u05E8\u05D5\u05DF \u05E0\u05DB\u05E9\u05DC, \u05E0\u05E0\u05E1\u05D4 \u05E9\u05D5\u05D1 \u05D1\u05E4\u05E2\u05DD \u05D4\u05D1\u05D0\u05D4");
+        return false;
+      })
+      .finally(() => {
+        syncingRef.current = null;
+        if (againRef.current) {
+          againRef.current = false;
+          schedulePush();
+        }
+      });
+    syncingRef.current = run;
+    return run;
   }
   function markSynced() {
     const now = /* @__PURE__ */ new Date().toISOString();
@@ -470,34 +727,28 @@ function useClinicData() {
     setDriveStatus("synced");
     setDriveError(null);
   }
-  function schedulePush(next) {
+  function schedulePush() {
     if (!connectedRef.current) return;
     if (pushTimerRef.current) clearTimeout(pushTimerRef.current);
     setDriveStatus("syncing");
     pushTimerRef.current = setTimeout(() => {
-      ensureToken(false, async (token) => {
+      ensureToken(false, (token) => {
         if (!token) {
           setDriveStatus("error");
-          setDriveError(
-            "\u05D4\u05D7\u05D9\u05D1\u05D5\u05E8 \u05E4\u05D2 \u2014 \u05D9\u05E9 \u05DC\u05D4\u05EA\u05D7\u05D1\u05E8 \u05DE\u05D7\u05D3\u05E9 \u05D1\u05D4\u05D2\u05D3\u05E8\u05D5\u05EA",
-          );
+          setDriveError("\u05D4\u05D7\u05D9\u05D1\u05D5\u05E8 \u05E4\u05D2 \u2014 \u05D9\u05E9 \u05DC\u05D4\u05EA\u05D7\u05D1\u05E8 \u05DE\u05D7\u05D3\u05E9 \u05D1\u05D4\u05D2\u05D3\u05E8\u05D5\u05EA");
           return;
         }
-        try {
-          const fileId = await findOrCreateFile(token);
-          await uploadToDrive(token, fileId, next);
-          markSynced();
-        } catch (e) {
-          setDriveStatus("error");
-          setDriveError("\u05D4\u05E1\u05E0\u05DB\u05E8\u05D5\u05DF \u05E0\u05DB\u05E9\u05DC, \u05E0\u05E0\u05E1\u05D4 \u05E9\u05D5\u05D1 \u05D1\u05E4\u05E2\u05DD \u05D4\u05D1\u05D0\u05D4");
-        }
+        syncNow(token);
       });
     }, 1500);
   }
   const persist = useCallback((next) => {
-    setDataState(next);
-    saveLocal(next);
-    schedulePush(next);
+    const stamped = stampChanges(dataRef.current, next);
+    dataRef.current = stamped;
+    dirtyRef.current = true;
+    setDataState(stamped);
+    saveLocal(stamped);
+    schedulePush();
   }, []);
   function connectDrive(newClientId, onDone) {
     setClientIdState(newClientId);
@@ -521,17 +772,10 @@ function useClinicData() {
         }
         connectedRef.current = true;
         try {
-          const fileId = await findOrCreateFile(token);
-          const remote = await downloadFromDrive(token, fileId);
-          const remoteHasData = remote && ((remote.patients || []).length || (remote.appointments || []).length || (remote.payments || []).length);
-          const localHasData = dataRef.current.patients.length || dataRef.current.appointments.length || dataRef.current.payments.length;
-          if (remoteHasData && !localHasData) {
-            setConflict(remote);
-          } else {
-            await uploadToDrive(token, fileId, dataRef.current);
-            markSynced();
-          }
-          onDone && onDone(true);
+          rememberVersion(null);
+          dirtyRef.current = true;
+          const ok = await syncNow(token);
+          onDone && onDone(ok);
         } catch (e) {
           setDriveStatus("error");
           setDriveError("\u05E9\u05D2\u05D9\u05D0\u05D4 \u05D1\u05D2\u05D9\u05E9\u05D4 \u05DC-Drive");
@@ -541,10 +785,7 @@ function useClinicData() {
     });
   }
   function resolveConflict(useRemote) {
-    if (useRemote && conflict) {
-      setDataState(conflict);
-      saveLocal(conflict);
-    }
+    if (useRemote && conflict) persist(conflict);
     setConflict(null);
   }
   function disconnectDrive() {
@@ -575,10 +816,9 @@ function useClinicData() {
         return;
       }
       try {
-        const fileId = await findOrCreateFile(token);
-        await uploadToDrive(token, fileId, dataRef.current);
-        markSynced();
-        onDone && onDone(true);
+        dirtyRef.current = true;
+        const ok = await syncNow(token);
+        onDone && onDone(ok);
       } catch (e) {
         setDriveStatus("error");
         setDriveError("\u05D4\u05E1\u05E0\u05DB\u05E8\u05D5\u05DF \u05E0\u05DB\u05E9\u05DC");
@@ -617,7 +857,7 @@ function useClinicData() {
         ensureToken(false, (token) => {
           if (token) {
             connectedRef.current = true;
-            setDriveStatus("synced");
+            syncNow(token);
           } else {
             setDriveStatus("disconnected");
           }
@@ -625,24 +865,83 @@ function useClinicData() {
       });
     }
   }, []);
-  function exportBackupFile() {
-    const blob = new Blob([JSON.stringify(dataRef.current, null, 2)], { type: "application/json" });
+  useEffect(() => {
+    try {
+      if (navigator.storage && navigator.storage.persist) navigator.storage.persist();
+    } catch (e) {}
+    if ((dataRef.current.appointments || []).some((a) => isInlineAudio(a.voiceNote))) saveLocal(dataRef.current);
+    const refs = (dataRef.current.appointments || []).filter((a) => isAudioRef(a.voiceNote));
+    if (!refs.length) return;
+    Promise.all(
+      refs.map((a) =>
+        audioGet(audioKeyOf(a.voiceNote))
+          .then((v) => [a.id, audioKeyOf(a.voiceNote), v])
+          .catch(() => [a.id, null, null]),
+      ),
+    ).then((rows) => {
+      const got = /* @__PURE__ */ new Map();
+      rows.forEach(([id, k, v]) => {
+        if (!isInlineAudio(v)) return;
+        got.set(id, v);
+        storedAudioRef.current.set(k, v);
+      });
+      if (!got.size) return;
+      const next = {
+        ...dataRef.current,
+        appointments: (dataRef.current.appointments || []).map((a) => (got.has(a.id) && isAudioRef(a.voiceNote) ? { ...a, voiceNote: got.get(a.id) } : a)),
+      };
+      dataRef.current = next;
+      setDataState(next);
+    });
+  }, []);
+  useEffect(() => {
+    const onVisible = () => {
+      if (document.visibilityState !== "visible" || !connectedRef.current) return;
+      if (Date.now() - lastPullRef.current < 2e4) return;
+      lastPullRef.current = Date.now();
+      ensureToken(false, (token) => {
+        if (token) syncNow(token);
+      });
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => document.removeEventListener("visibilitychange", onVisible);
+  }, []);
+  async function exportBackupFile() {
+    const full = await materializeAudio(dataRef.current, null);
+    const name = `clinic-backup-${todayISO()}.json`;
+    const blob = new Blob([JSON.stringify(full, null, 2)], { type: "application/json" });
+    try {
+      const file = new File([blob], name, { type: "application/json" });
+      if (navigator.canShare && navigator.canShare({ files: [file] })) {
+        await navigator.share({ files: [file], title: name });
+        return true;
+      }
+    } catch (e) {
+      if (e && e.name === "AbortError") return false;
+    }
+    const standalone = window.navigator.standalone === true || (window.matchMedia && window.matchMedia("(display-mode: standalone)").matches);
+    if (standalone) {
+      alert(
+        "\u05DC\u05D0 \u05E0\u05D9\u05EA\u05DF \u05DC\u05E9\u05DE\u05D5\u05E8 \u05E7\u05D5\u05D1\u05E5 \u05DE\u05EA\u05D5\u05DA \u05D4\u05D0\u05E4\u05DC\u05D9\u05E7\u05E6\u05D9\u05D4 \u05D1\u05DE\u05DB\u05E9\u05D9\u05E8 \u05D6\u05D4. \u05E4\u05EA\u05D7\u05D5 \u05D0\u05EA \u05D4\u05DB\u05EA\u05D5\u05D1\u05EA \u05D1\u05E1\u05E4\u05D0\u05E8\u05D9 \u05D5\u05D1\u05E6\u05E2\u05D5 \u05D2\u05D9\u05D1\u05D5\u05D9 \u05DE\u05E9\u05DD.",
+      );
+      return false;
+    }
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `clinic-backup-${todayISO()}.json`;
+    a.download = name;
     document.body.appendChild(a);
     a.click();
     a.remove();
-    URL.revokeObjectURL(url);
+    setTimeout(() => URL.revokeObjectURL(url), 4e3);
+    return true;
   }
   function importBackupFile(file, onDone) {
     const reader = new FileReader();
     reader.onload = () => {
       try {
         const parsed = JSON.parse(reader.result);
-        setDataState(parsed);
-        saveLocal(parsed);
+        persist(parsed);
         onDone && onDone(true);
       } catch (e) {
         onDone && onDone(false);
@@ -666,6 +965,7 @@ function useClinicData() {
     resolveConflict,
     exportBackupFile,
     importBackupFile,
+    saveError,
   };
 }
 function Modal({ title, onClose, children }) {
@@ -831,6 +1131,7 @@ function App() {
     resolveConflict,
     exportBackupFile,
     importBackupFile,
+    saveError,
   } = useClinicData();
   const { patients, appointments, payments } = data;
   const dismissals = data.dismissals || {};
@@ -984,8 +1285,13 @@ function App() {
   function saveApptNote(id, payload) {
     persist({ ...data, appointments: appointments.map((a) => (a.id === id ? { ...a, notes: payload.notes, voiceNote: payload.voiceNote } : a)) });
   }
-  function rescheduleAppt(id, newDate) {
-    persist({ ...data, appointments: appointments.map((a) => (a.id === id ? { ...a, date: newDate, status: "scheduled" } : a)) });
+  function moveAppt(id, newDate, newTime, status) {
+    const a = appointments.find((x) => x.id === id);
+    if (!a) return false;
+    const moved = { ...a, date: newDate, startTime: newTime || a.startTime, status: status || a.status };
+    if (!confirmConflicts(findConflicts([moved], new Set([id])))) return false;
+    persist({ ...data, appointments: appointments.map((x) => (x.id === id ? moved : x)) });
+    return true;
   }
   function setSetting(key, value) {
     persist({ ...data, settings: { ...(data.settings || {}), [key]: value } });
@@ -1186,6 +1492,29 @@ function App() {
     "div",
     { className: "clinic-app", dir: "rtl", lang: "he" },
     /* @__PURE__ */ React.createElement("style", null, styleSheet),
+    saveError &&
+      /* @__PURE__ */ React.createElement(
+        "div",
+        {
+          role: "alert",
+          style: {
+            position: "fixed",
+            top: 0,
+            left: 0,
+            right: 0,
+            zIndex: 9999,
+            background: "var(--color-rose)",
+            color: "#fff",
+            padding: "calc(env(safe-area-inset-top, 0px) + 12px) 16px 12px",
+            fontSize: 14.5,
+            fontWeight: 700,
+            lineHeight: 1.5,
+            textAlign: "center",
+            boxShadow: "0 2px 10px rgba(0,0,0,.25)",
+          },
+        },
+        saveError,
+      ),
     /* @__PURE__ */ React.createElement(
       "aside",
       { className: "sidebar-desktop", style: { width: 220, background: "var(--color-primary)", padding: "22px 14px", display: "flex", flexDirection: "column", flexShrink: 0 } },
@@ -1297,11 +1626,11 @@ function App() {
             onTogglePaid: toggleApptPaid,
             onMarkPaid: markApptsPaid,
             onSaveNote: saveApptNote,
+            onMoveAppt: moveAppt,
             onEditAppt: (a) => setApptModal(a),
             onRenewSeries: renewSeries,
             settings: data.settings || {},
             onSetSetting: setSetting,
-            onReschedule: rescheduleAppt,
             dismissals,
             onDismiss: dismissReminder,
             onRestoreReminders: restoreReminders,
@@ -1325,8 +1654,11 @@ function App() {
               onDelete: (p) =>
                 setConfirmDelete({
                   type: "patient",
+                  name: p.name,
                   id: p.id,
-                  label: `\u05D0\u05EA/\u05D4 \u05D1\u05D8\u05D5\u05D7/\u05D4 \u05E9\u05D1\u05E8\u05E6\u05D5\u05E0\u05DA \u05DC\u05DE\u05D7\u05D5\u05E7 \u05D0\u05EA ${p.name}? \u05DB\u05DC \u05D4\u05E4\u05D2\u05D9\u05E9\u05D5\u05EA \u05D5\u05D4\u05EA\u05E9\u05DC\u05D5\u05DE\u05D9\u05DD \u05E9\u05DC\u05D5/\u05D4 \u05D9\u05D9\u05DE\u05D7\u05E7\u05D5 \u05D2\u05DD \u05DB\u05DF.`,
+                  label: isActive(p)
+                    ? `\u05DC\u05DE\u05D7\u05D5\u05E7 \u05D0\u05EA ${p.name}? \u05D0\u05D9\u05DF \u05DC\u05D5/\u05D4 \u05E4\u05D2\u05D9\u05E9\u05D5\u05EA \u05D0\u05D5 \u05EA\u05E9\u05DC\u05D5\u05DE\u05D9\u05DD.`
+                    : `\u05DE\u05D7\u05D9\u05E7\u05D4 \u05DC\u05E6\u05DE\u05D9\u05EA\u05D5\u05EA \u05E9\u05DC ${p.name}: \u05DB\u05DC \u05D4\u05E4\u05D2\u05D9\u05E9\u05D5\u05EA, \u05D4\u05E1\u05D9\u05DB\u05D5\u05DE\u05D9\u05DD, \u05D4\u05D4\u05E7\u05DC\u05D8\u05D5\u05EA \u05D5\u05D4\u05EA\u05E9\u05DC\u05D5\u05DE\u05D9\u05DD \u05D9\u05D9\u05DE\u05D7\u05E7\u05D5 \u05D2\u05DD \u05D1\u05DE\u05DB\u05E9\u05D9\u05E8\u05D9\u05DD \u05D4\u05D0\u05D7\u05E8\u05D9\u05DD. \u05D0\u05D9 \u05D0\u05E4\u05E9\u05E8 \u05DC\u05E9\u05D7\u05D6\u05E8.`,
                 }),
               onAddAppt: (patientId) => setApptModal({ patientId, date: todayISO(), startTime: "10:00", duration: 50, status: "scheduled" }),
               onAddPayment: (patientId) => setPaymentModal({ patientId, date: todayISO(), amount: "", method: "cash" }),
@@ -1400,8 +1732,11 @@ function App() {
     confirmDelete &&
       /* @__PURE__ */ React.createElement(
         Modal,
-        { title: "\u05D0\u05D9\u05E9\u05D5\u05E8 \u05DE\u05D7\u05D9\u05E7\u05D4", onClose: () => setConfirmDelete(null) },
-        /* @__PURE__ */ React.createElement("p", { style: { color: "var(--color-ink-soft)", marginBottom: 20, lineHeight: 1.6 } }, confirmDelete.label),
+        {
+          title: "\u05D0\u05D9\u05E9\u05D5\u05E8 \u05DE\u05D7\u05D9\u05E7\u05D4",
+          onClose: () => setConfirmDelete(null),
+        },
+        /* @__PURE__ */ React.createElement("p", { style: { color: "var(--color-ink-soft)", marginBottom: 14, lineHeight: 1.6 } }, confirmDelete.label),
         /* @__PURE__ */ React.createElement(
           "div",
           { style: { display: "flex", gap: 10 } },
@@ -1482,6 +1817,44 @@ const LOVE_NOTES = [
   "יהיה יום טוב. ואם לא — נהפוך אותו לטוב ביחד 🤝",
   "מגיע לך הכול, ואני עוד עובד על זה 💍",
 ];
+function MoveApptPicker({ appt, today, onMove, onCancel }) {
+  const [date, setDate] = React.useState(appt.date);
+  const [time, setTime] = React.useState(appt.startTime);
+  const isPast = date <= today;
+  const big = { justifyContent: "center", width: "100%", padding: "13px 12px", fontSize: 15.5, marginBottom: 8 };
+  const chip = {
+    border: "1.5px solid var(--color-border)",
+    background: "#fff",
+    borderRadius: 999,
+    padding: "7px 13px",
+    fontSize: 13,
+    fontWeight: 600,
+    cursor: "pointer",
+    color: "var(--color-ink)",
+    fontFamily: "var(--font-body)"
+  };
+  const quick = [
+    ["היום", today],
+    ["שבוע הבא", isoDate(addDays(/* @__PURE__ */ new Date(appt.date + "T00:00:00"), 7))]
+  ];
+  return /* @__PURE__ */ React.createElement("div", { style: { background: "var(--color-bg)", borderRadius: 12, padding: 14, marginBottom: 10 } }, /* @__PURE__ */ React.createElement("p", { style: { margin: "0 0 10px", fontSize: 13.5, color: "var(--color-ink-soft)", fontWeight: 700 } }, "לאיזה תאריך ושעה הפגישה עברה?"), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 8, marginBottom: 10, flexWrap: "wrap" } }, quick.map(([label, dt]) => /* @__PURE__ */ React.createElement("button", { key: label, style: { ...chip, ...date === dt ? { background: "var(--color-primary)", color: "#fff", borderColor: "var(--color-primary)" } : null }, onClick: () => setDate(dt) }, label))), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 9, marginBottom: 12, flexWrap: "wrap" } }, /* @__PURE__ */ React.createElement(
+    "input",
+    {
+      type: "date",
+      value: date,
+      onChange: (e) => setDate(e.target.value),
+      style: { flex: 1, minWidth: 140, padding: "10px 11px", borderRadius: 9, border: "1.5px solid var(--color-border)", fontSize: 15, fontFamily: "var(--font-body)" }
+    }
+  ), /* @__PURE__ */ React.createElement(
+    "input",
+    {
+      type: "time",
+      value: time,
+      onChange: (e) => setTime(e.target.value),
+      style: { width: 118, padding: "10px 11px", borderRadius: 9, border: "1.5px solid var(--color-border)", fontSize: 15, fontFamily: "var(--font-body)" }
+    }
+  )), isPast ? /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("p", { style: { margin: "0 0 9px", fontSize: 13, color: "var(--color-ink-soft)", lineHeight: 1.55 } }, "התאריך כבר עבר — האם הפגישה אכן התקיימה אז?"), /* @__PURE__ */ React.createElement("button", { className: "btn-primary", style: { ...big, background: "var(--color-sage)" }, onClick: () => onMove(date, time, "completed") }, "✔ כן, הגיע/ה"), /* @__PURE__ */ React.createElement("button", { className: "btn-secondary", style: big, onClick: () => onMove(date, time, "scheduled") }, "עדיין לא בטוח — להשאיר לאישור")) : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("p", { style: { margin: "0 0 9px", fontSize: 13, color: "var(--color-ink-soft)", lineHeight: 1.55 } }, "הפגישה תיקבע למועד החדש. ביום שאחרי, נבקש כאן לאשר שהגיע/ה."), /* @__PURE__ */ React.createElement("button", { className: "btn-primary", style: big, onClick: () => onMove(date, time, "scheduled") }, "📅 קביעה למועד החדש")), /* @__PURE__ */ React.createElement("button", { className: "btn-ghost", style: { width: "100%", justifyContent: "center", padding: 9, fontSize: 13.5, color: "var(--color-ink-soft)", fontWeight: 600 }, onClick: onCancel }, "ביטול"));
+}
 function NoteCapture({ appt, onSave, onSkip }) {
   const [text, setText] = React.useState(appt.notes || "");
   const [voice, setVoice] = React.useState(appt.voiceNote || null);
@@ -1558,13 +1931,15 @@ function NoteCapture({ appt, onSave, onSkip }) {
     "✔ שמירת הסיכום"
   ), /* @__PURE__ */ React.createElement("button", { className: "btn-secondary", style: big, onClick: onSkip }, "לא צריך סיכום"));
 }
-function FocusFlow({ items, patientMap, onClose, onSetStatus, onReschedule, onDismiss, onMarkPaid, onRenewSeries, onEditAppt, onSaveNote, onSkipKind }) {
+function FocusFlow({ items, patientMap, onClose, onSetStatus, onDismiss, onMarkPaid, onRenewSeries, onEditAppt, onSaveNote, onMoveAppt, onSkipKind }) {
   const [queue, setQueue] = React.useState(() => items);
   const [idx, setIdx] = React.useState(0);
   const [done, setDone] = React.useState(0);
   const [later, setLater] = React.useState(0);
   const total = queue.length;
   const item = queue[idx];
+  const [pickingDate, setPickingDate] = React.useState(false);
+  React.useEffect(() => setPickingDate(false), [idx]);
   const skipKind = (kind) => {
     setQueue((q) => q.filter((it, i) => i <= idx || it.kind !== kind));
     setIdx((i) => i + 1);
@@ -1592,10 +1967,14 @@ function FocusFlow({ items, patientMap, onClose, onSetStatus, onReschedule, onDi
   } }, "✔ הגיע/ה"), /* @__PURE__ */ React.createElement("button", { className: "btn-secondary", style: bigBtn, onClick: () => {
     onSetStatus(item.appt.id, "noshow");
     advance(true);
-  } }, "✖ לא הגיע/ה"), /* @__PURE__ */ React.createElement("button", { className: "btn-secondary", style: bigBtn, onClick: () => {
-    onReschedule(item.appt, item.suggestedDate);
-    advance(true);
-  } }, "📅 נדחתה ל-", formatHeDateShort(item.suggestedDate)), /* @__PURE__ */ React.createElement("button", { className: "btn-secondary", style: bigBtn, onClick: () => {
+  } }, "✖ לא הגיע/ה"), !pickingDate && /* @__PURE__ */ React.createElement("button", { className: "btn-secondary", style: bigBtn, onClick: () => setPickingDate(true) }, "\u{1F4C5} \u05E2\u05D1\u05E8\u05D4 \u05DC\u05EA\u05D0\u05E8\u05D9\u05DA \u05D0\u05D7\u05E8"), pickingDate && /* @__PURE__ */ React.createElement(MoveApptPicker, {
+    appt: item.appt,
+    today: todayISO(),
+    onMove: (dt, tm, st) => {
+      if (onMoveAppt(item.appt.id, dt, tm, st)) advance(true);
+    },
+    onCancel: () => setPickingDate(false),
+  }), /* @__PURE__ */ React.createElement("button", { className: "btn-secondary", style: bigBtn, onClick: () => {
     onSetStatus(item.appt.id, "cancelled");
     advance(true);
   } }, "בוטלה")), item.kind === "note" && /* @__PURE__ */ React.createElement(NoteCapture, {
@@ -1623,7 +2002,7 @@ function FocusFlow({ items, patientMap, onClose, onSetStatus, onReschedule, onDi
     advance(true);
   } }, "ביקשתי — להזכיר בעוד 3 שבועות"), /* @__PURE__ */ React.createElement("button", { className: "btn-ghost", style: { ...bigBtn, fontWeight: 700, color: "var(--color-ink-soft)" }, onClick: () => skipKind("payment") }, "⏭ לדלג על כל התשלומים")), /* @__PURE__ */ React.createElement("button", { className: "btn-ghost", style: { width: "100%", justifyContent: "center", padding: 11, fontSize: 14, color: "var(--color-ink-soft)", fontWeight: 600 }, onClick: () => advance(false) }, "אחר כך ←"));
 }
-function Dashboard({ settings, onSetSetting, onReschedule, patients, appointments, payments, patientMap, dismissals, onDismiss, onRestoreReminders, onAddAppt, onAddPatient, onGoCalendar, onSetStatus, onTogglePaid, onMarkPaid, onSaveNote, onEditAppt, onRenewSeries, onOpenPatient }) {
+function Dashboard({ settings, onSetSetting, patients, appointments, payments, patientMap, dismissals, onDismiss, onRestoreReminders, onAddAppt, onAddPatient, onGoCalendar, onSetStatus, onTogglePaid, onMarkPaid, onSaveNote, onMoveAppt, onEditAppt, onRenewSeries, onOpenPatient }) {
   const today = todayISO();
   const nowTime = /* @__PURE__ */ new Date().toTimeString().slice(0, 5);
   const todaysAppts = appointments.filter((a) => a.date === today).sort((a, b) => a.startTime.localeCompare(b.startTime));
@@ -1658,7 +2037,7 @@ function Dashboard({ settings, onSetSetting, onReschedule, patients, appointment
       .filter((g) => !isDismissed(dismissals, g.key, g.sig, today))
       .sort((a, b) => a.last.localeCompare(b.last));
   })();
-  const weekAgo = isoDate(addDays(/* @__PURE__ */ new Date(today + "T00:00:00"), -7));
+  const weekAgo = isoDate(addDays(/* @__PURE__ */ new Date(today + "T00:00:00"), -30));
   const missingNotes = appointments
     .filter((a) => a.status === "completed" && !a.notes && !a.voiceNote && a.date <= today && a.date >= weekAgo)
     .filter((a) => isActive(patientMap[a.patientId] || {}))
@@ -1672,7 +2051,7 @@ function Dashboard({ settings, onSetSetting, onReschedule, patients, appointment
     .filter((a) => a.status === "scheduled" && (a.date < today || (a.date === today && a.startTime <= nowTime)))
     .sort((a, b) => (b.date + b.startTime).localeCompare(a.date + a.startTime));
   const [flowOpen, setFlowOpen] = useState(false);
-  const nextWeekOf = (dstr) => isoDate(addDays(/* @__PURE__ */ new Date(dstr + "T00:00:00"), 7));
+  const [movingAppt, setMovingAppt] = useState(null);
   const flowItems = useMemo(() => {
     const out = [];
     pendingAttendance.forEach((a) =>
@@ -1680,7 +2059,6 @@ function Dashboard({ settings, onSetSetting, onReschedule, patients, appointment
         kind: "attendance",
         patientId: a.patientId,
         appt: a,
-        suggestedDate: nextWeekOf(a.date),
         subtitle: `${formatHeDateShort(a.date)} \u00B7 ${a.startTime} \u2014 \u05E2\u05D3\u05D9\u05D9\u05DF \u05DE\u05E1\u05D5\u05DE\u05E0\u05EA \u05DB\u05E7\u05D1\u05D5\u05E2\u05D4`,
       }),
     );
@@ -1743,12 +2121,12 @@ function Dashboard({ settings, onSetSetting, onReschedule, patients, appointment
     ),
     /* @__PURE__ */ React.createElement(
       "div",
-      { className: "card", style: { padding: 18, marginBottom: 16, border: reminderCount > 0 ? "1.5px solid var(--color-rose)" : "1px solid var(--color-border)" } },
+      { className: "card", style: { padding: 18, marginBottom: 16, border: reminderCount > 0 ? "1.5px solid var(--color-rose)" : todoCount > 0 ? "1.5px solid var(--color-gold)" : "1px solid var(--color-border)" } },
       /* @__PURE__ */ React.createElement(
         "h3",
-        { style: { margin: "0 0 4px", fontSize: 16, color: reminderCount > 0 ? "var(--color-rose)" : "var(--color-ink)", display: "flex", alignItems: "center", gap: 7 } },
+        { style: { margin: "0 0 4px", fontSize: 16, color: reminderCount > 0 ? "var(--color-rose)" : todoCount > 0 ? "var(--color-gold)" : "var(--color-ink)", display: "flex", alignItems: "center", gap: 7 } },
         "\u{1F514} \u05EA\u05D6\u05DB\u05D5\u05E8\u05D5\u05EA",
-        reminderCount > 0 ? ` (${reminderCount})` : "",
+        todoCount > 0 ? ` (${todoCount})` : "",
       ),
       todoCount > 0 &&
         /* @__PURE__ */ React.createElement(
@@ -1765,24 +2143,37 @@ function Dashboard({ settings, onSetSetting, onReschedule, patients, appointment
             "\u2728 \u05D1\u05D5\u05D0\u05D9 \u05E0\u05E1\u05D3\u05E8 \u05D0\u05EA \u05D4\u05D9\u05D5\u05DD",
           ),
         ),
+      movingAppt &&
+        /* @__PURE__ */ React.createElement(
+          Modal,
+          { title: patientMap[movingAppt.patientId]?.name || "\u2014", onClose: () => setMovingAppt(null) },
+          /* @__PURE__ */ React.createElement(MoveApptPicker, {
+            appt: movingAppt,
+            today,
+            onMove: (dt, tm, st) => {
+              if (onMoveAppt(movingAppt.id, dt, tm, st)) setMovingAppt(null);
+            },
+            onCancel: () => setMovingAppt(null),
+          }),
+        ),
       flowOpen &&
         /* @__PURE__ */ React.createElement(FocusFlow, {
           items: flowItems,
           patientMap,
           onClose: () => setFlowOpen(false),
           onSetStatus,
-          onReschedule: (a, dt) => onReschedule(a.id, dt),
           onDismiss,
           onMarkPaid,
           onRenewSeries: (g) => onRenewSeries(g.patientId, g.dow, g.time, 12),
           onEditAppt,
           onSaveNote,
+          onMoveAppt,
           onSkipKind: (k) => {
             if (k === "payment" && window.confirm("\u05DC\u05D4\u05E1\u05EA\u05D9\u05E8 \u05EA\u05D6\u05DB\u05D5\u05E8\u05D5\u05EA \u05EA\u05E9\u05DC\u05D5\u05DD \u05D2\u05DD \u05D1\u05D4\u05DE\u05E9\u05DA? \u05EA\u05DE\u05D9\u05D3 \u05E0\u05D9\u05EA\u05DF \u05DC\u05D4\u05D7\u05D6\u05D9\u05E8 \u05D1\u05D4\u05D2\u05D3\u05E8\u05D5\u05EA."))
               onSetSetting("hidePaymentReminders", true);
           },
         }),
-      reminderCount === 0
+      todoCount === 0 && reminderCount === 0
         ? /* @__PURE__ */ React.createElement(
             "p",
             { style: { margin: "8px 0 0", fontSize: 13.5, color: "var(--color-ink-soft)" } },
@@ -2052,6 +2443,18 @@ function Dashboard({ settings, onSetSetting, onReschedule, patients, appointment
                         style: { border: "none", cursor: "pointer", borderRadius: 9, padding: "8px 14px", fontSize: 13.5, fontWeight: 700, background: "var(--color-rose)", color: "#fff" },
                       },
                       "\u05DC\u05D0 \u05D4\u05D2\u05D9\u05E2",
+                    ),
+                    /* @__PURE__ */ React.createElement(
+                      "button",
+                      {
+                        onClick: (e) => {
+                          e.stopPropagation();
+                          setMovingAppt(a);
+                        },
+                        title: "\u05E2\u05D1\u05E8\u05D4 \u05DC\u05EA\u05D0\u05E8\u05D9\u05DA \u05D0\u05D7\u05E8",
+                        style: { border: "1.5px solid var(--color-border)", cursor: "pointer", borderRadius: 9, padding: "7px 12px", fontSize: 13.5, fontWeight: 700, background: "#fff", color: "var(--color-ink)" },
+                      },
+                      "\u{1F4C5} \u05EA\u05D0\u05E8\u05D9\u05DA \u05D0\u05D7\u05E8",
                     ),
                   ),
                 ),
@@ -2641,12 +3044,13 @@ function PatientsView({
               /* @__PURE__ */ React.createElement(I.edit, { size: 14 }),
               "\u05E2\u05E8\u05D9\u05DB\u05D4",
             ),
-            /* @__PURE__ */ React.createElement(
-              "button",
-              { className: "btn-secondary", style: { color: "var(--color-rose)", borderColor: "var(--color-rose-soft)" }, onClick: () => onDelete(selected) },
-              /* @__PURE__ */ React.createElement(I.trash, { size: 14 }),
-              "\u05DE\u05D7\u05D9\u05E7\u05D4",
-            ),
+            (!isActive(selected) || (!appointments.some((a) => a.patientId === selected.id) && !payments.some((p) => p.patientId === selected.id))) &&
+              /* @__PURE__ */ React.createElement(
+                "button",
+                { className: "btn-secondary", style: { color: "var(--color-rose)", borderColor: "var(--color-rose-soft)" }, onClick: () => onDelete(selected) },
+                /* @__PURE__ */ React.createElement(I.trash, { size: 14 }),
+                isActive(selected) ? "\u05DE\u05D7\u05D9\u05E7\u05D4" : "\u05DE\u05D7\u05D9\u05E7\u05D4 \u05DC\u05E6\u05DE\u05D9\u05EA\u05D5\u05EA",
+              ),
           ),
           /* @__PURE__ */ React.createElement(
             "button",

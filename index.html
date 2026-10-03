@@ -2043,7 +2043,7 @@ function Dashboard({ settings, onSetSetting, patients, appointments, payments, p
     .filter((a) => isActive(patientMap[a.patientId] || {}))
     .filter((a) => !isDismissed(dismissals, "note:" + a.id, "1", today))
     .sort((a, b) => (b.date + b.startTime).localeCompare(a.date + a.startTime));
-  const showPayments = !(settings || {}).hidePaymentReminders;
+  const showPayments = !!(settings || {}).showPaymentReminders;
   const shownPaymentReminders = showPayments ? paymentReminders : [];
   const reminderCount = shownPaymentReminders.length + renewals.length + missingNotes.length;
   const dismissedCount = activeDismissals(dismissals, today).length;
@@ -2170,7 +2170,7 @@ function Dashboard({ settings, onSetSetting, patients, appointments, payments, p
           onMoveAppt,
           onSkipKind: (k) => {
             if (k === "payment" && window.confirm("\u05DC\u05D4\u05E1\u05EA\u05D9\u05E8 \u05EA\u05D6\u05DB\u05D5\u05E8\u05D5\u05EA \u05EA\u05E9\u05DC\u05D5\u05DD \u05D2\u05DD \u05D1\u05D4\u05DE\u05E9\u05DA? \u05EA\u05DE\u05D9\u05D3 \u05E0\u05D9\u05EA\u05DF \u05DC\u05D4\u05D7\u05D6\u05D9\u05E8 \u05D1\u05D4\u05D2\u05D3\u05E8\u05D5\u05EA."))
-              onSetSetting("hidePaymentReminders", true);
+              onSetSetting("showPaymentReminders", false);
           },
         }),
       todoCount === 0 && reminderCount === 0
@@ -3810,7 +3810,7 @@ function SettingsView({
   exportBackupFile,
   importBackupFile,
 }) {
-  const hidePay = !!(settings || {}).hidePaymentReminders;
+  const hidePay = !(settings || {}).showPaymentReminders;
   const [inputClientId, setInputClientId] = useState(clientId || "");
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState(null);
@@ -3860,17 +3860,17 @@ function SettingsView({
       /* @__PURE__ */ React.createElement(
         "p",
         { style: { margin: "0 0 12px", fontSize: 13, color: "var(--color-ink-soft)", lineHeight: 1.65 } },
-        "\u05D0\u05E4\u05E9\u05E8 \u05DC\u05DB\u05D1\u05D5\u05EA \u05D0\u05EA \u05EA\u05D6\u05DB\u05D5\u05E8\u05D5\u05EA \u05D4\u05EA\u05E9\u05DC\u05D5\u05DD \u05D1\u05DE\u05E1\u05DA \u05D4\u05D1\u05D9\u05EA. \u05D4\u05E1\u05DB\u05D5\u05DE\u05D9\u05DD \u05D9\u05DE\u05E9\u05D9\u05DB\u05D5 \u05DC\u05D4\u05D5\u05E4\u05D9\u05E2 \u05D1\u05DB\u05E8\u05D8\u05D9\u05E1 \u05D4\u05DE\u05D8\u05D5\u05E4\u05DC \u05D5\u05D1\u05DE\u05E1\u05DA \u05DB\u05E1\u05E4\u05D9\u05DD \u2014 \u05E8\u05E7 \u05DC\u05D0 \u05D9\u05D1\u05E7\u05E9\u05D5 \u05EA\u05E9\u05D5\u05DE\u05EA \u05DC\u05D1.",
+        "\u05EA\u05D6\u05DB\u05D5\u05E8\u05D5\u05EA \u05D4\u05EA\u05E9\u05DC\u05D5\u05DD \u05DB\u05D1\u05D5\u05D9\u05D5\u05EA \u05DB\u05D1\u05E8\u05D9\u05E8\u05EA \u05DE\u05D7\u05D3\u05DC. \u05D0\u05E4\u05E9\u05E8 \u05DC\u05D4\u05E4\u05E2\u05D9\u05DC \u05D0\u05D5\u05EA\u05DF \u05DB\u05D3\u05D9 \u05DC\u05E7\u05D1\u05DC \u05D1\u05DE\u05E1\u05DA \u05D4\u05D1\u05D9\u05EA \u05EA\u05D6\u05DB\u05D5\u05E8\u05EA \u05E2\u05DC \u05DE\u05D8\u05D5\u05E4\u05DC\u05D9\u05DD \u05E9\u05D8\u05E8\u05DD \u05E9\u05D9\u05DC\u05DE\u05D5. \u05D1\u05DB\u05DC \u05DE\u05E7\u05E8\u05D4, \u05D4\u05E1\u05DB\u05D5\u05DE\u05D9\u05DD \u05DE\u05D5\u05E4\u05D9\u05E2\u05D9\u05DD \u05D1\u05DB\u05E8\u05D8\u05D9\u05E1 \u05D4\u05DE\u05D8\u05D5\u05E4\u05DC \u05D5\u05D1\u05DE\u05E1\u05DA \u05DB\u05E1\u05E4\u05D9\u05DD.",
       ),
       /* @__PURE__ */ React.createElement(
         "button",
         {
           className: hidePay ? "btn-secondary" : "btn-primary",
           style: { width: "100%", justifyContent: "center", padding: 13 },
-          onClick: () => onSetSetting("hidePaymentReminders", !hidePay),
+          onClick: () => onSetSetting("showPaymentReminders", hidePay),
         },
         hidePay
-          ? "\u05DE\u05D5\u05E1\u05EA\u05E8\u05D5\u05EA \u2014 \u05DC\u05D4\u05E4\u05E2\u05DC\u05D4 \u05DE\u05D7\u05D3\u05E9"
+          ? "\u05DB\u05D1\u05D5\u05D9\u05D5\u05EA \u2014 \u05DC\u05D4\u05E4\u05E2\u05DC\u05D4"
           : "\u05E4\u05E2\u05D9\u05DC\u05D5\u05EA \u2014 \u05DC\u05DB\u05D9\u05D1\u05D5\u05D9",
       ),
     ),
